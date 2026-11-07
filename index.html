@@ -1,0 +1,1538 @@
+import React, { useEffect, useMemo, useRef, useState } from 'react';
+import {
+  ActivityIndicator, Alert, AppState, Image, SafeAreaView, ScrollView,
+  StatusBar, StyleSheet, Text, TextInput, TouchableOpacity, View, Share,
+} from 'react-native';
+import AsyncStorage from '@react-native-async-storage/async-storage';
+import type { Session } from '@supabase/supabase-js';
+import { supabase } from './supabase';
+import * as Notifications from 'expo-notifications';
+import * as Device from 'expo-device';
+import Constants from 'expo-constants';
+import * as Linking from 'expo-linking';
+
+type Sport = 'Course' | 'Vélo' | 'CrossFit' | 'HYROX' | 'Natation' | 'Tennis' | 'Padel';
+type Screen = 'welcome' | 'challenges' | 'create' | 'challenge' | 'performances' | 'activity' | 'join' | 'progress';
+type Challenge = { id: string; name: string; goal: number; days: number; startAt: number; participants: string[] };
+type Activity = { id: string; sport: Sport; amount: number; elevation: number; points: number; date: string; createdAt: number; cloudId?: string; ownerId?: string };
+type WeightEntry = { id: string; user_id: string; measured_on: string; weight_kg: number };
+type Store = { challenges: Challenge[]; activities: Activity[]; nickname: string };
+type CloudChallenge = { id: string; creator_id: string; title: string; challenge_type: 'distance' | 'duration'; target_kme: number | null; starts_at: string; ends_at: string | null; invite_code: string; archived_at: string | null; finished_at: string | null; winner_user_id: string | null };
+type CloudParticipant = { user_id: string; joined_at: string };
+type LeaderboardEntry = { user_id: string; pseudo: string; score: number; activities: number | null; final_rank?: number };
+
+
+const BG = '#101012';
+const PANEL = '#202023';
+const ORANGE = '#FF7417';
+const STORAGE_KEY = 'frun_v2_data';
+const LEGACY_KEY = 'frun_data';
+const DAY_MS = 86400000;
+const sports: { name: Sport; emoji: string; unit: string }[] = [
+  { name: 'Course', emoji: '🏃', unit: 'km' },
+  { name: 'Vélo', emoji: '🚴', unit: 'km' },
+  { name: 'CrossFit', emoji: '🏋️', unit: 'min' },
+  { name: 'HYROX', emoji: '💪', unit: 'min' },
+  { name: 'Natation', emoji: '🏊', unit: 'm' },
+  { name: 'Tennis', emoji: '🎾', unit: 'min' },
+  { name: 'Padel', emoji: '', unit: 'min' },
+];
+
+function pointsFor(sport: Sport, amount: number, elevation: number) {
+  switch (sport) {
+    case 'Course': return amount + elevation / 100;
+    case 'Vélo': return amount / 2.5 + (elevation / 100) * 0.6;
+    case 'CrossFit': return amount / 8;
+    case 'HYROX': return amount / 6;
+    case 'Natation': return amount / 250;
+    case 'Tennis': return amount / 10;
+    case 'Padel': return amount / 20;
+  }
+}
+const fmt = (n: number) => n.toLocaleString('fr-FR', { maximumFractionDigits: 2 });
+const numberFrom = (s: string) => Number(s.replace(',', '.'));
+const newId = () => `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+const validSport = (s: unknown): s is Sport => sports.some(item => item.name === s);
+
+function SportIcon({ sport, size = 28 }: { sport: Sport; size?: number }) {
+  if (sport === 'Padel') {
+    return <Image source={require('./assets/padel.png')} style={{ width: size, height: size, borderRadius: 5 }} resizeMode="contain" />;
+  }
+  return <Text style={{ fontSize: size * 0.85 }}>{sports.find(s => s.name === sport)?.emoji}</Text>;
+}
+
+function Action({ title, onPress, secondary = false }: { title: string; onPress: () => void; secondary?: boolean }) {
+  return (
+    <TouchableOpacity onPress={onPress} activeOpacity={0.8} style={[styles.button, secondary && styles.secondaryButton]}>
+      <Text style={[styles.buttonText, secondary && styles.secondaryButtonText]}>{title}</Text>
+    </TouchableOpacity>
+  );
+}
+
+function HomeLink({ onPress }: { onPress: () => void }) {
+  return (
+    <View style={styles.homeLinkWrap}>
+      <TouchableOpacity
+        accessibilityRole="button"
+        accessibilityLabel="Retour à l’accueil"
+        activeOpacity={0.7}
+        onPress={onPress}
+        style={styles.homeLink}
+      >
+        <Text style={styles.homeLinkIcon}>⌂</Text>
+        <Text style={styles.homeLinkText}>Retour à l’accueil</Text>
+        <Text style={styles.homeLinkArrow}>›</Text>
+      </TouchableOpacity>
+    </View>
+  );
+}
+
+function migrateLegacy(raw: string): Store {
+  const legacy = JSON.parse(raw);
+  const now = Date.now();
+  const challenges: Challenge[] = [];
+  if (legacy?.challenge && Number(legacy.challenge.goal) > 0) {
+    challenges.push({
+      id: 'legacy-challenge', name: String(legacy.challenge.name || 'Mon premier défi'),
+      goal: Number(legacy.challenge.goal), days: Number(legacy.challenge.days) || 15,
+      // Anciens défis sans date de début : démarrent aujourd'hui pour les prochaines activités.
+      startAt: now - 2000, participants: ['Moi'],
+    });
+  }
+  const activities: Activity[] = Array.isArray(legacy?.activities)
+    ? legacy.activities.filter((a: any) => validSport(a.sport)).map((a: any, i: number) => ({
+        id: `legacy-${String(a.id ?? i)}-${i}`, sport: a.sport,
+        amount: Number(a.amount) || 0, elevation: Number(a.elevation) || 0,
+        points: Number(a.points) || 0,
+        date: String(a.date || new Date().toLocaleDateString('fr-FR')),
+        // Anciennes activités rattachées au défi importé, mais pas aux défis créés plus tard.
+        createdAt: now - 1000 - i,
+      }))
+    : [];
+  return { challenges, activities, nickname: 'Moi' };
+}
+
+export default function App() {
+  const [screen, setScreen] = useState<Screen>('welcome');
+  const [authLoading, setAuthLoading] = useState(true);
+  const [authBusy, setAuthBusy] = useState(false);
+  const [session, setSession] = useState<Session | null>(null);
+  const [authMode, setAuthMode] = useState<'login' | 'signup' | 'reset' | 'newPassword'>('login');
+  const [recoveryReady, setRecoveryReady] = useState(false);
+  const recoveryLinksInProgress = useRef(new Set<string>());
+  const [authEmail, setAuthEmail] = useState('');
+  const [authPassword, setAuthPassword] = useState('');
+  const [authPseudo, setAuthPseudo] = useState('');
+  const [accountPseudo, setAccountPseudo] = useState('');
+  const [emailPending, setEmailPending] = useState(false);
+  const [loaded, setLoaded] = useState(false);
+  const [store, setStore] = useState<Store>({ challenges: [], activities: [], nickname: 'Moi' });
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [challengeName, setChallengeName] = useState('');
+  const [goal, setGoal] = useState('100');
+  const [days, setDays] = useState('15');
+  const [sport, setSport] = useState<Sport>('Course');
+  const [amount, setAmount] = useState('');
+  const [elevation, setElevation] = useState('');
+  const [joinCode, setJoinCode] = useState('');
+  const [activityReturn, setActivityReturn] = useState<'challenge' | 'performances'>('performances');
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [activityBusy, setActivityBusy] = useState(false);
+  const [activitiesLoading, setActivitiesLoading] = useState(false);
+  const [cloudChallenges, setCloudChallenges] = useState<CloudChallenge[]>([]);
+  const [cloudSelectedId, setCloudSelectedId] = useState<string | null>(null);
+  const [cloudParticipants, setCloudParticipants] = useState<CloudParticipant[]>([]);
+  const [cloudBusy, setCloudBusy] = useState(false);
+  const [cloudLoading, setCloudLoading] = useState(false);
+  const [cloudError, setCloudError] = useState('');
+  const [leaderboard, setLeaderboard] = useState<LeaderboardEntry[]>([]);
+  const [rankingLoading, setRankingLoading] = useState(false);
+  const [rankingError, setRankingError] = useState('');
+  const [rankingFinal, setRankingFinal] = useState(false);
+  const [clockNow, setClockNow] = useState(Date.now());
+  const [weights, setWeights] = useState<WeightEntry[]>([]);
+  const [weightInput, setWeightInput] = useState('');
+  const [weightDate, setWeightDate] = useState(new Date().toISOString().slice(0, 10));
+  const [weightBusy, setWeightBusy] = useState(false);
+  const [progressPeriod, setProgressPeriod] = useState<1 | 3 | 6 | 12 | 0>(6);
+  const progressMetric: 'count' = 'count';
+  const [recordSport, setRecordSport] = useState<Sport>('Course');
+  const [progressHistoryAll, setProgressHistoryAll] = useState(false);
+
+  async function refreshWeights(userId: string) {
+    const { data, error } = await supabase.from('frun_weight_entries')
+      .select('id,user_id,measured_on,weight_kg').eq('user_id', userId)
+      .order('measured_on', { ascending: true });
+    if (error) { Alert.alert('Suivi du poids', error.message); return; }
+    setWeights((data || []).map(w => ({ ...w, weight_kg: Number(w.weight_kg) })));
+  }
+
+  useEffect(() => {
+    if (!session?.user?.id) { setWeights([]); return; }
+    void refreshWeights(session.user.id);
+  }, [session?.user?.id]);
+
+  async function saveWeight() {
+    if (!session?.user?.id || weightBusy) return;
+    const value = numberFrom(weightInput);
+    if (!weightInput.trim() || !Number.isFinite(value) || value <= 0 || value >= 500 ||
+        !/^\d{4}-\d{2}-\d{2}$/.test(weightDate) ||
+        !Number.isFinite(new Date(weightDate + 'T12:00:00').getTime()) ||
+        new Date(weightDate + 'T12:00:00').toISOString().slice(0, 10) !== weightDate ||
+        weightDate > new Date().toISOString().slice(0, 10)) {
+      Alert.alert('Mesure invalide', 'Indique un poids valide et une date au format AAAA-MM-JJ (pas dans le futur).');
+      return;
+    }
+    setWeightBusy(true);
+    try {
+      const { error } = await supabase.from('frun_weight_entries').upsert({
+        user_id: session.user.id, measured_on: weightDate, weight_kg: value,
+      }, { onConflict: 'user_id,measured_on' });
+      if (error) throw error;
+      const oldBest = weights.length ? Math.min(...weights.map(w => w.weight_kg)) : null;
+      const baseline = weights.length ? weights[0].weight_kg : null;
+      const previous = weights.find(w => w.measured_on === weightDate);
+      await refreshWeights(session.user.id);
+      setWeightInput('');
+      if (!previous && baseline !== null && oldBest !== null && value < oldBest &&
+          Math.floor(Math.max(0, baseline - value) / 2) > Math.floor(Math.max(0, baseline - oldBest) / 2)) {
+        Alert.alert('💪 Une étape franchie !', 'Ton suivi montre une évolution de 2 kg supplémentaires depuis ta première mesure. Continue à prendre soin de toi à ton rythme !');
+      }
+    } catch (e: any) { Alert.alert('Enregistrement impossible', e.message || 'Erreur réseau'); }
+    finally { setWeightBusy(false); }
+  }
+
+  function deleteWeight(w: WeightEntry) {
+    Alert.alert('Supprimer cette mesure ?', `${w.measured_on} · ${fmt(w.weight_kg)} kg`, [
+      { text: 'Annuler', style: 'cancel' },
+      { text: 'Supprimer', style: 'destructive', onPress: () => { void (async () => {
+        const { error } = await supabase.from('frun_weight_entries').delete().eq('id', w.id).eq('user_id', w.user_id);
+        if (error) Alert.alert('Suppression impossible', error.message);
+        else setWeights(prev => prev.filter(x => x.id !== w.id));
+      })(); } },
+    ]);
+  }
+
+  useEffect(() => {
+    let active = true;
+    supabase.auth.getSession().then(({ data, error }) => {
+      if (!active) return;
+      if (error) console.log('Session FRUN :', error.message);
+      setSession(data.session);
+      setAuthLoading(false);
+    }).catch(error => {
+      if (active) { console.log('Session FRUN :', error); setAuthLoading(false); }
+    });
+
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((event, nextSession) => {
+      if (!active) return;
+      setSession(nextSession);
+      if (event === 'PASSWORD_RECOVERY') {
+        setRecoveryReady(true);
+        setAuthMode('newPassword');
+        setAuthPassword('');
+      }
+    });
+    return () => { active = false; subscription.unsubscribe(); };
+  }, []);
+
+  // Un lien de récupération Supabase ouvre FRUN avec des jetons temporaires.
+  // Ne jamais afficher ni enregistrer ces jetons dans les logs.
+  useEffect(() => {
+    let active = true;
+    async function handleRecoveryLink(url: string | null) {
+      if (!url || !url.startsWith('frun://auth/callback')) return;
+      if (recoveryLinksInProgress.current.has(url)) return;
+      recoveryLinksInProgress.current.add(url);
+      try {
+        const query = url.split('?')[1]?.split('#')[0] || '';
+        const fragment = url.split('#')[1] || '';
+        const params = new URLSearchParams([query, fragment].filter(Boolean).join('&'));
+        const errorDescription = params.get('error_description');
+        if (errorDescription || params.get('error')) {
+          throw new Error(errorDescription || 'Lien invalide ou expiré.');
+        }
+        const accessToken = params.get('access_token');
+        const refreshToken = params.get('refresh_token');
+        const tokenHash = params.get('token_hash');
+        const code = params.get('code');
+        if (accessToken && refreshToken) {
+          const { error } = await supabase.auth.setSession({
+            access_token: accessToken, refresh_token: refreshToken,
+          });
+          if (error) throw error;
+        } else if (tokenHash) {
+          const { error } = await supabase.auth.verifyOtp({
+            token_hash: tokenHash, type: 'recovery',
+          });
+          if (error) throw error;
+        } else if (code) {
+          const { error } = await supabase.auth.exchangeCodeForSession(code);
+          if (error) throw error;
+        } else {
+          throw new Error('Ce lien ne contient pas de jeton de récupération valide.');
+        }
+        if (!active) return;
+        setRecoveryReady(true);
+        setAuthMode('newPassword');
+        setAuthPassword('');
+      } catch (error: any) {
+        if (active) {
+          setRecoveryReady(false);
+          Alert.alert('Lien de réinitialisation', error?.message || 'Lien invalide ou expiré. Demande un nouveau lien.');
+        }
+      }
+    }
+    void Linking.getInitialURL().then(handleRecoveryLink).catch(() => {});
+    const listener = Linking.addEventListener('url', ({ url }) => { void handleRecoveryLink(url); });
+    return () => { active = false; listener.remove(); };
+  }, []);
+
+  useEffect(() => {
+    if (!session?.user) { setAccountPseudo(''); return; }
+    let active = true;
+    const user = session.user;
+    const proposed = typeof user.user_metadata?.pseudo === 'string' ? user.user_metadata.pseudo.trim() : '';
+    (async () => {
+      try {
+        const { data, error } = await supabase.from('profiles').select('pseudo').eq('id', user.id).maybeSingle();
+        if (error) throw error;
+        if (data?.pseudo) { if (active) setAccountPseudo(data.pseudo); return; }
+        if (proposed) {
+          const { error: insertError } = await supabase.from('profiles').insert({ id: user.id, pseudo: proposed });
+          if (insertError && insertError.code !== '23505') throw insertError;
+          if (active) setAccountPseudo(proposed);
+        } else if (active) {
+          setAccountPseudo('');
+        }
+      } catch (error) {
+        console.log('Profil FRUN :', error);
+        if (active) Alert.alert('Profil', 'Connexion réussie, mais le pseudo n’a pas pu être chargé.');
+      }
+    })();
+    return () => { active = false; };
+  }, [session?.user?.id]);
+
+  // Enregistre le jeton Expo pour le compte connecté, sur un appareil physique.
+  useEffect(() => {
+    const userId = session?.user?.id;
+    if (!userId || !Device.isDevice) return;
+    let active = true;
+    (async () => {
+      try {
+        const existing = await Notifications.getPermissionsAsync();
+        const permission = existing.granted
+          ? existing
+          : await Notifications.requestPermissionsAsync();
+        if (!permission.granted || !active) return;
+        const projectId = Constants.easConfig?.projectId ?? Constants.expoConfig?.extra?.eas?.projectId;
+        if (!projectId) {
+          console.log('FRUN notifications : identifiant du projet EAS introuvable.');
+          return;
+        }
+        const token = await Notifications.getExpoPushTokenAsync({ projectId });
+        if (!active || !token.data) return;
+        const platform = Device.osName === 'iOS' ? 'ios' : Device.osName === 'Android' ? 'android' : null;
+        if (!platform) return;
+        const { error } = await supabase.from('frun_push_tokens').upsert(
+          {
+            user_id: userId,
+            expo_push_token: token.data,
+            platform,
+            updated_at: new Date().toISOString(),
+          },
+          { onConflict: 'expo_push_token' }
+        );
+        if (error) throw error;
+        if (active) console.log('FRUN notifications : appareil enregistré dans Supabase.');
+      } catch (error) {
+        if (active) console.log('FRUN notifications : enregistrement impossible.', error);
+      }
+    })();
+    return () => { active = false; };
+  }, [session?.user?.id]);
+
+  // Les activites cloud font autorite; les anciennes activites sans correspondance restent locales.
+  async function refreshCloudActivities(userId: string) {
+    setActivitiesLoading(true);
+    try {
+      const { data, error } = await supabase.from('frun_activities')
+        .select('id,user_id,sport,amount,elevation_m,kme,performed_at')
+        .eq('user_id', userId).order('performed_at', { ascending: false });
+      if (error) throw error;
+      const rows = (data || []).filter(a => validSport(
+        sports.find(sp => sp.name.toLowerCase() === String(a.sport).toLowerCase())?.name
+      )).map(a => {
+        const sportName = sports.find(sp => sp.name.toLowerCase() === String(a.sport).toLowerCase())!.name;
+        const timestamp = new Date(a.performed_at).getTime();
+        return {
+          id: String(a.id), cloudId: String(a.id), ownerId: userId, sport: sportName,
+          amount: Number(a.amount), elevation: Number(a.elevation_m) || 0,
+          points: Number(a.kme) || 0, date: new Date(timestamp).toLocaleDateString('fr-FR'),
+          createdAt: timestamp,
+        } as Activity;
+      });
+      setStore(prev => {
+        // Reconcilier les performances creees dans les anciennes versions sans ID serveur.
+        const unmatched = prev.activities.filter(a => !a.cloudId && !a.ownerId);
+        const remaining = unmatched.filter(local => !rows.some(remote =>
+          local.sport === remote.sport && Math.abs(local.amount - remote.amount) < 0.00001 &&
+          Math.abs(local.points - remote.points) < 0.00001 &&
+          Math.abs(local.createdAt - remote.createdAt) < 120000
+        ));
+        return { ...prev, activities: [...rows, ...remaining] };
+      });
+    } catch (error: any) {
+      Alert.alert('Synchronisation', error?.message || 'Impossible de charger les performances.');
+    } finally {
+      setActivitiesLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    if (loaded && session?.user?.id) void refreshCloudActivities(session.user.id);
+  }, [loaded, session?.user?.id]);
+
+  async function refreshCloudChallenges() {
+    if (!session?.user) return;
+    setCloudLoading(true);
+    const { data, error } = await supabase.from('frun_challenges')
+      .select('id,creator_id,title,challenge_type,target_kme,starts_at,ends_at,invite_code,archived_at,finished_at,winner_user_id')
+      .order('created_at', { ascending: false });
+    setCloudLoading(false);
+    if (error) { setCloudError(error.message); return; }
+    setCloudError('');
+    setCloudChallenges((data || []) as CloudChallenge[]);
+  }
+
+  async function refreshCloudParticipants(challengeId: string) {
+    const { data, error } = await supabase.from('frun_participants')
+      .select('user_id,joined_at').eq('challenge_id', challengeId);
+    if (error) { Alert.alert('Participants', error.message); return; }
+    setCloudParticipants((data || []) as CloudParticipant[]);
+  }
+
+  async function refreshLeaderboard(challengeId: string) {
+    if (!session?.user?.id) return;
+    setRankingLoading(true);
+    setRankingError('');
+    try {
+      const { data: challenge, error: challengeError } = await supabase.from('frun_challenges')
+        .select('starts_at,ends_at,finished_at,winner_user_id').eq('id', challengeId).single();
+      if (challengeError) throw challengeError;
+      // Refresh the challenge status too: a challenge may have finished on another phone.
+      setCloudChallenges(prev => prev.map(item => item.id === challengeId
+        ? { ...item, finished_at: challenge.finished_at, winner_user_id: challenge.winner_user_id }
+        : item));
+      const { data: participants, error: participantError } = await supabase.from('frun_participants')
+        .select('user_id,joined_at').eq('challenge_id', challengeId);
+      if (participantError) throw participantError;
+      const ids = (participants || []).map(p => p.user_id as string);
+      setCloudParticipants((participants || []) as CloudParticipant[]);
+      if (!ids.length) { setLeaderboard([]); setRankingFinal(!!challenge.finished_at); return; }
+
+      const profilesPromise = supabase.from('profiles').select('id,pseudo').in('id', ids);
+      if (challenge.finished_at) {
+        // Frozen scores/ranks are authoritative once the challenge is finished.
+        const [profilesResult, finalsResult] = await Promise.all([
+          profilesPromise,
+          supabase.from('frun_final_rankings')
+            .select('user_id,final_rank,final_score')
+            .eq('challenge_id', challengeId)
+            .order('final_rank', { ascending: true }),
+        ]);
+        if (profilesResult.error) throw profilesResult.error;
+        if (finalsResult.error) throw finalsResult.error;
+        if (!finalsResult.data?.length) throw new Error('Le classement définitif est encore indisponible. Réessaie dans un instant.');
+        const pseudos = new Map((profilesResult.data || []).map(p => [p.id as string, String(p.pseudo || '')]));
+        setLeaderboard(finalsResult.data.map(f => ({
+          user_id: f.user_id,
+          pseudo: pseudos.get(f.user_id) || (f.user_id === session.user.id ? accountPseudo || 'Moi' : 'Joueur FRUN'),
+          score: Number(f.final_score) || 0,
+          activities: null,
+          final_rank: Number(f.final_rank),
+        })));
+        setRankingFinal(true);
+      } else {
+        const [profilesResult, activitiesResult] = await Promise.all([
+          profilesPromise,
+          (() => {
+            let query = supabase.from('frun_activities').select('user_id,kme,performed_at')
+              .in('user_id', ids).gte('performed_at', challenge.starts_at);
+            if (challenge.ends_at) query = query.lte('performed_at', challenge.ends_at);
+            return query;
+          })(),
+        ]);
+        if (profilesResult.error) throw profilesResult.error;
+        if (activitiesResult.error) throw activitiesResult.error;
+        const pseudos = new Map((profilesResult.data || []).map(p => [p.id as string, String(p.pseudo || '')]));
+        const scores = new Map<string, { score: number; activities: number }>();
+        for (const a of activitiesResult.data || []) {
+          const prev = scores.get(a.user_id) || { score: 0, activities: 0 };
+          prev.score += Number(a.kme) || 0;
+          prev.activities += 1;
+          scores.set(a.user_id, prev);
+        }
+        const entries: LeaderboardEntry[] = ids.map(user_id => ({
+          user_id,
+          pseudo: pseudos.get(user_id) || (user_id === session.user.id ? accountPseudo || 'Moi' : 'Joueur FRUN'),
+          score: scores.get(user_id)?.score || 0,
+          activities: scores.get(user_id)?.activities || 0,
+        }));
+        entries.sort((a, b) => b.score - a.score || a.pseudo.localeCompare(b.pseudo, 'fr'));
+        setLeaderboard(entries);
+        setRankingFinal(false);
+      }
+      setClockNow(Date.now());
+    } catch (error: any) {
+      setRankingError(error?.message || 'Impossible de charger le classement.');
+      setLeaderboard([]);
+    } finally {
+      setRankingLoading(false);
+    }
+  }
+
+  function openCloudChallenge(id: string) {
+    setCloudSelectedId(id);
+    setSelectedId(null);
+    setLeaderboard([]);
+    setRankingFinal(false);
+    void refreshLeaderboard(id);
+    setScreen('challenge');
+  }
+
+  useEffect(() => {
+    if (!session?.user?.id) {
+      setStore(prev => ({ ...prev, activities: prev.activities.filter(a => !a.ownerId) }));
+      setCloudChallenges([]); setCloudParticipants([]); setCloudSelectedId(null); setLeaderboard([]);
+      return;
+    }
+    void refreshCloudChallenges();
+  }, [session?.user?.id]);
+
+  useEffect(() => {
+    if (screen === 'challenges' && session?.user) void refreshCloudChallenges();
+  }, [screen, session?.user?.id]);
+
+  useEffect(() => {
+    const subscription = AppState.addEventListener('change', state => {
+      if (state === 'active' && session?.user?.id) {
+        void refreshCloudChallenges();
+        if (screen === 'challenge' && cloudSelectedId) void refreshLeaderboard(cloudSelectedId);
+      }
+    });
+    return () => subscription.remove();
+  }, [session?.user?.id, screen, cloudSelectedId]);
+
+  // Classement actualise automatiquement tant que le defi partage est affiche.
+  useEffect(() => {
+    if (screen !== 'challenge' || !cloudSelectedId || !session?.user?.id) return;
+    const timer = setInterval(() => {
+      if (AppState.currentState === 'active') void refreshLeaderboard(cloudSelectedId);
+    }, 30000);
+    return () => clearInterval(timer);
+  }, [screen, cloudSelectedId, session?.user?.id]);
+
+  async function createCloudChallenge() {
+    if (!session?.user || cloudBusy) return;
+    const g = numberFrom(goal);
+    const d = numberFrom(days);
+    if (!challengeName.trim() || challengeName.trim().length > 100 || !Number.isFinite(g) || g <= 0 || !Number.isInteger(d) || d <= 0) {
+      Alert.alert('Vérification', 'Indique un nom (100 caractères maximum), un objectif positif et une durée entière en jours.');
+      return;
+    }
+    setCloudBusy(true);
+    try {
+      const start = new Date();
+      const end = new Date(start.getTime() + d * DAY_MS);
+      const { data, error } = await supabase.from('frun_challenges').insert({
+        creator_id: session.user.id, title: challengeName.trim(), challenge_type: 'distance',
+        target_kme: g, starts_at: start.toISOString(), ends_at: end.toISOString(),
+      }).select('id,creator_id,title,challenge_type,target_kme,starts_at,ends_at,invite_code,archived_at,finished_at,winner_user_id').single();
+      if (error) throw error;
+      setCloudChallenges(prev => [data as CloudChallenge, ...prev]);
+      setCloudSelectedId(data.id); setSelectedId(null); setChallengeName('');
+      openCloudChallenge(data.id);
+    } catch (e: any) { Alert.alert('Création du défi', e.message || 'Échec de la création.'); }
+    finally { setCloudBusy(false); }
+  }
+
+  async function joinCloudChallenge() {
+    if (cloudBusy || !joinCode.trim()) { if (!joinCode.trim()) Alert.alert('Code', 'Saisis un code d’invitation.'); return; }
+    setCloudBusy(true);
+    try {
+      const { data, error } = await supabase.rpc('frun_join_challenge', { p_invite_code: joinCode.trim().toUpperCase() });
+      if (error) throw error;
+      const id = data as string;
+      await refreshCloudChallenges();
+      setCloudSelectedId(id); setSelectedId(null); setJoinCode('');
+      openCloudChallenge(id);
+    } catch (e: any) { Alert.alert('Invitation', e.message || 'Impossible de rejoindre le défi.'); }
+    finally { setCloudBusy(false); }
+  }
+
+  function backToChallenges() {
+    setCloudSelectedId(null);
+    setSelectedId(null);
+    setScreen('challenges');
+    void refreshCloudChallenges();
+  }
+
+  function confirmLeaveCloudChallenge(c: CloudChallenge) {
+    if (!session?.user || cloudBusy || c.creator_id === session.user.id) return;
+    Alert.alert('Quitter ce défi ?', `Tu ne participeras plus à « ${c.title} ». Tes performances resteront dans ton historique.`, [
+      { text: 'Annuler', style: 'cancel' },
+      { text: 'Quitter le défi', style: 'destructive', onPress: () => { void (async () => {
+        setCloudBusy(true);
+        try {
+          const { data, error } = await supabase.from('frun_participants').delete()
+            .eq('challenge_id', c.id).eq('user_id', session.user.id).select('user_id');
+          if (error) throw error;
+          if (!data?.length) throw new Error('Participation introuvable ou suppression non autorisée.');
+          setCloudChallenges(prev => prev.filter(item => item.id !== c.id));
+          backToChallenges();
+        } catch (e: any) { Alert.alert('Impossible de quitter', e.message || 'Erreur réseau.'); }
+        finally { setCloudBusy(false); }
+      })(); } },
+    ]);
+  }
+
+  function confirmDeleteCloudChallenge(c: CloudChallenge) {
+    if (!session?.user || cloudBusy || c.creator_id !== session.user.id) return;
+    Alert.alert('Supprimer définitivement ?', `« ${c.title} » disparaîtra pour tous les participants. Les performances personnelles seront conservées.`, [
+      { text: 'Annuler', style: 'cancel' },
+      { text: 'Supprimer pour tous', style: 'destructive', onPress: () => { void (async () => {
+        setCloudBusy(true);
+        try {
+          const { data, error } = await supabase.from('frun_challenges').delete()
+            .eq('id', c.id).eq('creator_id', session.user.id).select('id');
+          if (error) throw error;
+          if (!data?.length) throw new Error('Défi introuvable ou suppression non autorisée.');
+          setCloudChallenges(prev => prev.filter(item => item.id !== c.id));
+          backToChallenges();
+        } catch (e: any) { Alert.alert('Suppression impossible', e.message || 'Erreur réseau.'); }
+        finally { setCloudBusy(false); }
+      })(); } },
+    ]);
+  }
+
+  function confirmArchiveCloudChallenge(c: CloudChallenge) {
+    if (!session?.user || cloudBusy || c.creator_id !== session.user.id || c.archived_at) return;
+    Alert.alert('Archiver ce défi ?', `« ${c.title} » restera consultable avec son classement. Les performances ne seront pas supprimées.`, [
+      { text: 'Annuler', style: 'cancel' },
+      { text: 'Archiver', onPress: () => { void (async () => {
+        setCloudBusy(true);
+        try {
+          const archivedAt = new Date().toISOString();
+          const { data, error } = await supabase.from('frun_challenges')
+            .update(c.finished_at ? { archived_at: archivedAt } : { archived_at: archivedAt, ends_at: c.ends_at && new Date(c.ends_at).getTime() < Date.now() ? c.ends_at : archivedAt })
+            .eq('id', c.id).eq('creator_id', session.user.id).is('archived_at', null)
+            .select('id,archived_at,ends_at').single();
+          if (error) throw error;
+          setCloudChallenges(prev => prev.map(item => item.id === c.id
+            ? { ...item, archived_at: data.archived_at, ends_at: data.ends_at } : item));
+          await refreshLeaderboard(c.id);
+        } catch (e: any) { Alert.alert('Archivage impossible', e.message || 'Erreur réseau.'); }
+        finally { setCloudBusy(false); }
+      })(); } },
+    ]);
+  }
+
+  async function shareCloudInvitation(c: CloudChallenge) {
+    try {
+      await Share.share({ message: `Rejoins mon défi FRUN « ${c.title} » !\nCode d'invitation : ${c.invite_code}\nOuvre FRUN > Rejoindre un défi et saisis ce code.` });
+    } catch (e: any) { Alert.alert('Partage', e.message || 'Impossible de partager le code.'); }
+  }
+
+  async function saveNewPassword() {
+    if (!recoveryReady) {
+      Alert.alert('Lien requis', 'Ouvre le lien de réinitialisation reçu par e-mail avant de modifier ton mot de passe.');
+      return;
+    }
+    if (authPassword.length < 8) {
+      Alert.alert('Mot de passe', 'Utilise au moins 8 caractères.');
+      return;
+    }
+    setAuthBusy(true);
+    try {
+      const { data: { session: currentSession }, error: sessionError } = await supabase.auth.getSession();
+      if (sessionError || !currentSession) throw new Error('Session de récupération expirée. Demande un nouveau lien.');
+      const { error } = await supabase.auth.updateUser({ password: authPassword });
+      if (error) throw error;
+      setAuthPassword('');
+      setRecoveryReady(false);
+      setAuthMode('login');
+      // L'utilisateur se reconnecte explicitement avec son nouveau mot de passe.
+      const { error: signOutError } = await supabase.auth.signOut();
+      if (signOutError) throw signOutError;
+      setScreen('welcome');
+      Alert.alert('Mot de passe modifié', 'Ton mot de passe a été enregistré. Connecte-toi avec le nouveau mot de passe.');
+    } catch (error: any) {
+      Alert.alert('Réinitialisation', error?.message || 'Impossible de modifier le mot de passe.');
+    } finally {
+      setAuthBusy(false);
+    }
+  }
+
+  async function submitAuth() {
+    const email = authEmail.trim().toLowerCase();
+    if (!email.includes('@') || !email.includes('.')) { Alert.alert('E-mail', 'Indique une adresse e-mail valide.'); return; }
+    if (authMode === 'signup' && authPseudo.trim().length < 2) { Alert.alert('Pseudo', 'Choisis un pseudo d’au moins 2 caractères.'); return; }
+    if (authMode !== 'reset' && authPassword.length < 8) { Alert.alert('Mot de passe', 'Utilise au moins 8 caractères.'); return; }
+    setAuthBusy(true);
+    try {
+      if (authMode === 'signup') {
+        const { data, error } = await supabase.auth.signUp({
+          email, password: authPassword, options: { data: { pseudo: authPseudo.trim() } },
+        });
+        if (error) throw error;
+        if (!data.session) {
+          setEmailPending(true);
+          Alert.alert('Vérifie tes e-mails', 'Si ton inscription est acceptée, tu recevras un lien de confirmation. Clique dessus, puis reviens te connecter dans FRUN.');
+          setAuthMode('login');
+        } else {
+          Alert.alert('Bienvenue !', 'Ton compte FRUN est créé.');
+        }
+      } else if (authMode === 'login') {
+        const { error } = await supabase.auth.signInWithPassword({ email, password: authPassword });
+        if (error) throw error;
+        setEmailPending(false);
+      } else {
+       
+const { error } = await supabase.auth.resetPasswordForEmail(email, {
+  redirectTo: 'frun://auth/callback',
+});
+if (error) throw error;
+
+Alert.alert(
+  'E-mail envoyé',
+  'Si cette adresse possède un compte, tu recevras un lien pour réinitialiser ton mot de passe.'
+);
+setAuthMode('login');
+      }
+    } catch (error: any) {
+      Alert.alert('Connexion FRUN', error?.message || 'Une erreur est survenue. Réessaie.');
+    } finally { setAuthBusy(false); }
+  }
+
+  async function logout() {
+    setRecoveryReady(false);
+    setAuthMode('login');
+    const { error } = await supabase.auth.signOut();
+    if (error) { Alert.alert('Déconnexion', error.message); return; }
+    setScreen('welcome');
+    setAuthPassword('');
+  }
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const current = await AsyncStorage.getItem(STORAGE_KEY);
+        if (current) {
+          const parsed = JSON.parse(current);
+          setStore({
+            challenges: Array.isArray(parsed.challenges) ? parsed.challenges : [],
+            activities: Array.isArray(parsed.activities) ? parsed.activities : [],
+            nickname: typeof parsed.nickname === 'string' ? parsed.nickname : 'Moi',
+          });
+        } else {
+          const legacy = await AsyncStorage.getItem(LEGACY_KEY);
+          if (legacy) {
+            const migrated = migrateLegacy(legacy);
+            // Enregistrer la migration avant d'activer les sauvegardes.
+            await AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(migrated));
+            setStore(migrated);
+          }
+        }
+      } catch (error) {
+        console.log('FRUN chargement :', error);
+        Alert.alert('Chargement', 'Impossible de lire les données locales. Ne désinstalle pas Expo Go.');
+      } finally {
+        setLoaded(true);
+      }
+    })();
+  }, []);
+
+  useEffect(() => {
+    if (!loaded) return;
+    AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(store)).catch(error => {
+      console.log('FRUN sauvegarde :', error);
+      Alert.alert('Sauvegarde', 'La sauvegarde locale a échoué.');
+    });
+  }, [store, loaded]);
+
+  useEffect(() => {
+    if (screen !== 'challenge' || !cloudSelectedId) return;
+    const timer = setInterval(() => setClockNow(Date.now()), 60000);
+    return () => clearInterval(timer);
+  }, [screen, cloudSelectedId]);
+
+  const selected = store.challenges.find(c => c.id === selectedId) || null;
+  const cloudSelected = cloudChallenges.find(c => c.id === cloudSelectedId) || null;
+  const activitiesSorted = useMemo(() => [...store.activities].sort((a, b) => b.createdAt - a.createdAt), [store.activities]);
+  const totalSolo = store.activities.reduce((sum, a) => sum + a.points, 0);
+  const challengeActivities = (c: Challenge) => store.activities.filter(a => a.createdAt >= c.startAt && a.createdAt < c.startAt + c.days * DAY_MS);
+  const challengeScore = (c: Challenge) => challengeActivities(c).reduce((sum, a) => sum + a.points, 0);
+  const amountValue = numberFrom(amount);
+  const elevationValue = numberFrom(elevation);
+  const hasElevation = sport === 'Course' || sport === 'Vélo';
+  const elevationValid = !hasElevation || !elevation.trim() || (Number.isFinite(elevationValue) && elevationValue >= 0);
+  const preview = amount.trim() && Number.isFinite(amountValue) && amountValue > 0 && elevationValid
+    ? pointsFor(sport, amountValue, hasElevation && elevation.trim() ? elevationValue : 0) : 0;
+
+  function createChallenge() {
+    const g = numberFrom(goal);
+    const d = numberFrom(days);
+    if (!challengeName.trim() || !Number.isFinite(g) || g <= 0 || !Number.isInteger(d) || d <= 0) {
+      Alert.alert('Vérification', 'Indique un nom, un objectif positif et une durée entière en jours.');
+      return;
+    }
+    const c: Challenge = { id: newId(), name: challengeName.trim(), goal: g, days: d, startAt: Date.now(), participants: [store.nickname] };
+    setStore(prev => ({ ...prev, challenges: [c, ...prev.challenges] }));
+    setSelectedId(c.id);
+    setChallengeName('');
+    setScreen('challenge');
+  }
+
+  function confirmDeleteChallenge(c: Challenge) {
+    Alert.alert(
+      'Supprimer ce défi ?',
+      `« ${c.name} » sera supprimé définitivement. Tes activités resteront dans Mes performances.`,
+      [
+        { text: 'Annuler', style: 'cancel' },
+        {
+          text: 'Supprimer',
+          style: 'destructive',
+          onPress: () => {
+            setStore(prev => ({
+              ...prev,
+              challenges: prev.challenges.filter(item => item.id !== c.id),
+            }));
+            setSelectedId(null);
+            setScreen('challenges');
+          },
+        },
+      ]
+    );
+  }
+
+  async function saveActivity() {
+    if (activityBusy) return;
+    if (!amount.trim() || !Number.isFinite(amountValue) || amountValue <= 0 || !elevationValid) {
+      Alert.alert('Verification', 'Saisis une distance ou une duree positive, et un denivele valide.');
+      return;
+    }
+    if (!session?.user?.id) { Alert.alert('Connexion', 'Connecte-toi pour enregistrer une performance.'); return; }
+    const elev = hasElevation && elevation.trim() ? elevationValue : 0;
+    const score = pointsFor(sport, amountValue, elev);
+    const original = editingId ? store.activities.find(a => a.id === editingId) : null;
+    const previousSameSport = store.activities.filter(a => a.sport === sport && a.id !== editingId);
+    const achievements: string[] = [];
+    if (!editingId && previousSameSport.length) {
+      if (score > Math.max(...previousSameSport.map(a => a.points))) achievements.push(`🏆 Record kmE : ${fmt(score)} kmE`);
+      if (amountValue > Math.max(...previousSameSport.map(a => a.amount))) achievements.push(`🥇 Record ${hasElevation || sport === 'Natation' ? 'distance' : 'durée'} : ${fmt(amountValue)} ${sports.find(x => x.name === sport)?.unit}`);
+      if (hasElevation && elev > 0 && elev > Math.max(...previousSameSport.map(a => a.elevation))) achievements.push(`⛰️ Record D+ : ${fmt(elev)} m`);
+    }
+    if (editingId && !original) { Alert.alert('Erreur', 'Performance introuvable.'); return; }
+    if (original && !original.cloudId) {
+      Alert.alert('Ancienne performance', 'Cette performance est uniquement sur ce telephone. Elle ne peut pas etre modifiee en ligne. Tu peux creer une nouvelle performance synchronisee.');
+      return;
+    }
+    setActivityBusy(true);
+    try {
+      const now = new Date();
+      const payload = { sport: sport.toLowerCase(), amount: amountValue, elevation_m: elev, kme: score };
+      if (original?.cloudId) {
+        const { error } = await supabase.from('frun_activities').update(payload)
+          .eq('id', original.cloudId).eq('user_id', session.user.id).select('id').single();
+        if (error) throw error;
+        setStore(prev => ({ ...prev, activities: prev.activities.map(a => a.id === original.id
+          ? { ...a, sport, amount: amountValue, elevation: elev, points: score } : a) }));
+      } else {
+        const { data, error } = await supabase.from('frun_activities').insert({
+          ...payload, user_id: session.user.id, performed_at: now.toISOString(),
+        }).select('id').single();
+        if (error) throw error;
+        const a: Activity = {
+          id: String(data.id), cloudId: String(data.id), ownerId: session.user.id,
+          sport, amount: amountValue, elevation: elev, points: score,
+          date: now.toLocaleDateString('fr-FR'), createdAt: now.getTime(),
+        };
+        setStore(prev => ({ ...prev, activities: [a, ...prev.activities] }));
+      }
+      setEditingId(null);
+      setAmount(''); setElevation('');
+      if (cloudSelectedId) void refreshLeaderboard(cloudSelectedId);
+      setScreen(activityReturn);
+      if (achievements.length) Alert.alert('🔥 BRAVO ! Nouveau record FRUN', achievements.join('\n') + '\n\nContinue comme ça !');
+      else if (!editingId && [5, 10, 25, 50, 100, 200, 500].includes(store.activities.length + 1))
+        Alert.alert('🔥 Bravo pour ta régularité !', `${store.activities.length + 1} séances enregistrées dans FRUN !`);
+    } catch (error: any) {
+      Alert.alert('Synchronisation impossible', `${error?.message || 'Erreur reseau'}\n\nAucune modification locale n'a ete appliquee.`);
+    } finally { setActivityBusy(false); }
+  }
+
+  function openActivity(from: 'challenge' | 'performances') {
+    setActivityReturn(from);
+    setEditingId(null);
+    setSport('Course');
+    setAmount('');
+    setElevation('');
+    setScreen('activity');
+  }
+
+  function editActivity(a: Activity) {
+    setEditingId(a.id);
+    setSport(a.sport);
+    setAmount(String(a.amount));
+    setElevation(a.elevation ? String(a.elevation) : '');
+    setActivityReturn(screen === 'challenge' ? 'challenge' : 'performances');
+    setScreen('activity');
+  }
+
+  function confirmDeleteActivity(a: Activity) {
+    Alert.alert('Supprimer cette performance ?',
+      `Cette activite ${a.sport} (${fmt(a.points)} kmE) sera retiree de ton historique et de tous les defis concernes.`, [
+        { text: 'Annuler', style: 'cancel' },
+        { text: 'Supprimer', style: 'destructive', onPress: () => { void (async () => {
+          if (activityBusy) return;
+          if (a.cloudId) {
+            if (!session?.user?.id) return;
+            setActivityBusy(true);
+            try {
+              const { error } = await supabase.from('frun_activities').delete()
+                .eq('id', a.cloudId).eq('user_id', session.user.id).select('id').single();
+              if (error) throw error;
+            } catch (error: any) {
+              Alert.alert('Suppression impossible', error?.message || 'Erreur reseau');
+              return;
+            } finally { setActivityBusy(false); }
+          }
+          setStore(prev => ({ ...prev, activities: prev.activities.filter(item => item.id !== a.id) }));
+          if (cloudSelectedId) void refreshLeaderboard(cloudSelectedId);
+        })(); } },
+      ]);
+  }
+
+  async function shareInvitation() {
+    Alert.alert(
+      'Invitations bientôt disponibles',
+      "Le partage entre téléphones nécessite des comptes et un serveur. Pour l'instant, ce défi reste sur ton iPhone."
+    );
+  }
+
+  function activityRow(a: Activity) {
+    const unit = sports.find(s => s.name === a.sport)?.unit || '';
+    return (
+      <View key={a.id} style={styles.activityRow}>
+        <View style={styles.activityTop}>
+          <SportIcon sport={a.sport} size={21} />
+          <Text style={styles.activityName} numberOfLines={1}>{a.sport}</Text>
+          <Text style={styles.orangeText}>+{fmt(a.points)} kmE</Text>
+          <TouchableOpacity accessibilityRole="button" accessibilityLabel="Modifier cette performance" hitSlop={6} onPress={() => editActivity(a)} style={styles.smallAction}>
+            <Text style={styles.smallActionText}>✏️</Text>
+          </TouchableOpacity>
+          <TouchableOpacity accessibilityRole="button" accessibilityLabel="Supprimer cette performance" hitSlop={6} onPress={() => confirmDeleteActivity(a)} style={styles.smallAction}>
+            <Text style={styles.deleteText}>🗑️</Text>
+          </TouchableOpacity>
+        </View>
+        <Text style={styles.activityDetails} numberOfLines={1}>
+          {fmt(a.amount)} {unit}{a.elevation > 0 ? ` · D+ ${fmt(a.elevation)} m` : ''} · {a.date}
+        </Text>
+      </View>
+    );
+  }
+
+  if (authLoading || !loaded) return (
+    <SafeAreaView style={styles.loading}>
+      <ActivityIndicator size="large" color={ORANGE} />
+      <Text style={styles.muted}>Chargement de FRUN...</Text>
+    </SafeAreaView>
+  );
+
+  if (!session || recoveryReady) return (
+    <SafeAreaView style={styles.safe}>
+      <StatusBar barStyle="light-content" />
+      <ScrollView keyboardShouldPersistTaps="handled" contentContainerStyle={styles.authContainer}>
+        <Text style={styles.logo}>FR<Text style={{ color: ORANGE }}>U</Text>N.</Text>
+        <Text style={styles.tagline}>FRIENDS. RUN. FUN.</Text>
+       <Text style={[styles.title, { marginTop: 32 }]}>
+  {authMode === 'signup' ? 'Créer mon compte'
+    : authMode === 'reset' ? 'Mot de passe oublié'
+    : authMode === 'newPassword' ? 'Nouveau mot de passe'
+    : 'Se connecter'}
+</Text>
+
+<Text style={styles.description}>
+  {authMode === 'signup' ? 'Rejoins FRUN et prépare tes défis entre amis.'
+    : authMode === 'reset' ? 'Saisis ton adresse e-mail.'
+    : authMode === 'newPassword' ? 'Choisis un nouveau mot de passe pour ton compte FRUN.'
+    : 'Retrouve ton espace FRUN.'}
+</Text>
+        {emailPending && authMode !== 'newPassword' && <Text style={styles.authNotice}>Pense à confirmer ton adresse e-mail avant de te connecter.</Text>}
+        {authMode === 'signup' && <>
+          <Text style={styles.label}>MON PSEUDO</Text>
+          <TextInput style={styles.input} value={authPseudo} onChangeText={setAuthPseudo} placeholder="Ex : AlexRunner" placeholderTextColor="#777" autoCapitalize="none" maxLength={40} />
+        </>}
+        {authMode !== 'newPassword' && <>
+          <Text style={styles.label}>MON ADRESSE E-MAIL</Text>
+          <TextInput style={styles.input} value={authEmail} onChangeText={setAuthEmail} placeholder="monadresse@exemple.fr" placeholderTextColor="#777" autoCapitalize="none" autoCorrect={false} keyboardType="email-address" textContentType="emailAddress" />
+        </>}
+        {authMode !== 'reset' && <>
+          <Text style={styles.label}>{authMode === 'newPassword' ? 'NOUVEAU MOT DE PASSE' : 'MON MOT DE PASSE'}</Text>
+          <TextInput style={styles.input} value={authPassword} onChangeText={setAuthPassword} placeholder="8 caractères minimum" placeholderTextColor="#777" secureTextEntry autoCapitalize="none" textContentType={authMode === 'newPassword' ? 'newPassword' : 'password'} />
+        </>}
+       <Action
+  title={
+    authBusy ? 'Patiente un instant...'
+      : authMode === 'signup' ? 'Créer mon compte'
+      : authMode === 'reset' ? 'Envoyer le lien'
+      : authMode === 'newPassword' ? 'Enregistrer mon nouveau mot de passe'
+      : 'Se connecter'
+  }
+  onPress={() => {
+    if (authBusy) return;
+    if (authMode === 'newPassword') {
+      void saveNewPassword();
+    } else {
+      void submitAuth();
+    }
+  }}
+/>
+        {authBusy && <ActivityIndicator color={ORANGE} />}
+        {authMode === 'login' ? <>
+          <Action title="Créer un compte" secondary onPress={() => setAuthMode('signup')} />
+          <TouchableOpacity onPress={() => setAuthMode('reset')} style={{ paddingVertical: 12 }}><Text style={styles.authLink}>Mot de passe oublié ?</Text></TouchableOpacity>
+        </> : authMode === 'newPassword' ? null : <Action title="← Retour à la connexion" secondary onPress={() => setAuthMode('login')} />}
+        <Text style={styles.muted}>Les performances synchronisees sont retrouvees sur tes appareils. Les anciennes activites locales restent sur ce telephone.</Text>
+      </ScrollView>
+    </SafeAreaView>
+  );
+
+  if (!loaded) return (
+    <SafeAreaView style={styles.loading}>
+      <ActivityIndicator size="large" color={ORANGE} />
+      <Text style={styles.muted}>Chargement de FRUN...</Text>
+    </SafeAreaView>
+  );
+
+  return (
+    <SafeAreaView style={styles.safe}>
+      <StatusBar barStyle="light-content" />
+      <ScrollView contentContainerStyle={styles.container} keyboardShouldPersistTaps="handled">
+        <TouchableOpacity onPress={() => setScreen('welcome')} style={styles.header}>
+          <Text style={styles.logo}>FR<Text style={{ color: ORANGE }}>U</Text>N.</Text>
+          <Text style={styles.tagline}>FRIENDS. RUN. FUN.</Text>
+        </TouchableOpacity>
+
+        {screen === 'welcome' && (
+          <View style={styles.section}>
+            <Text style={styles.title}>Prêt à bouger ? 🔥</Text>
+            <Text style={styles.description}>Connecté : {accountPseudo || session.user.email || 'Mon compte'}</Text>
+            <TouchableOpacity onPress={() => void logout()} style={{ alignSelf: 'flex-start', paddingVertical: 8 }}><Text style={styles.authLink}>Se déconnecter</Text></TouchableOpacity>
+            <Text style={styles.description}>Des défis entre amis, ou juste le plaisir de cumuler tes performances.</Text>
+            <TouchableOpacity style={styles.mainTile} onPress={() => setScreen('challenges')}>
+              <Text style={styles.tileTitle}>🏆  Mes défis</Text>
+              <Text style={styles.tileDescription}>Créer et partager un défi · {store.challenges.length + cloudChallenges.length} défi(s)</Text>
+            </TouchableOpacity>
+            <TouchableOpacity style={styles.tile} onPress={() => setScreen('performances')}>
+              <Text style={styles.tileTitle}>💪  Mes performances</Text>
+              <Text style={styles.tileDescription}>Enregistrer une activité, même en solo</Text>
+            </TouchableOpacity>
+            <TouchableOpacity style={[styles.tile, { borderWidth: 1, borderColor: ORANGE }]} onPress={() => { setScreen('progress'); if (session?.user?.id) void refreshWeights(session.user.id); }}>
+              <Text style={styles.tileTitle}>📈  Ma progression</Text>
+              <Text style={styles.tileDescription}>Mes records, mes graphiques et mes réussites 🔥</Text>
+            </TouchableOpacity>
+            <TouchableOpacity style={styles.tile} onPress={() => setScreen('join')}>
+              <Text style={styles.tileTitle}>🤝  Rejoindre un défi</Text>
+              <Text style={styles.tileDescription}>Saisis le code envoyé par un ami</Text>
+            </TouchableOpacity>
+            <Text style={styles.muted}>Tes activités sont enregistrées une seule fois et comptent automatiquement dans les défis en cours.</Text>
+          </View>
+        )}
+
+        {screen === 'challenges' && (
+          <View style={styles.section}>
+            <Text style={styles.title}>🏆 Mes défis</Text>
+            <Text style={styles.description}>Retrouve tes défis ou lance un nouveau challenge.</Text>
+            <View style={styles.challengeNavRow}>
+              <TouchableOpacity accessibilityRole="button" accessibilityLabel="Créer un défi" activeOpacity={0.8} style={[styles.challengeNavButton, styles.challengeNavCreate]} onPress={() => setScreen('create')}>
+                <Text style={styles.challengeNavCreateText}>+ Créer un défi</Text>
+              </TouchableOpacity>
+              <TouchableOpacity accessibilityRole="button" accessibilityLabel="Retour à l'accueil" activeOpacity={0.8} style={[styles.challengeNavButton, styles.challengeNavHome]} onPress={() => setScreen('welcome')}>
+                <Text style={styles.challengeNavHomeText}>⌂ Accueil</Text>
+              </TouchableOpacity>
+            </View>
+            {cloudLoading && <ActivityIndicator color={ORANGE} size="small" />}
+            {!!cloudError && <Text style={styles.authNotice}>Synchronisation : {cloudError}</Text>}
+            {store.challenges.length + cloudChallenges.length === 0 && <Text style={styles.description}>Tu n'as pas encore de défi.</Text>}
+            {cloudChallenges.filter(c => !c.archived_at).map(c => (
+              <TouchableOpacity key={c.id} style={[styles.tile, { borderColor: ORANGE, borderWidth: 1 }]} onPress={() => openCloudChallenge(c.id)}>
+                <Text style={styles.tileTitle}>🌐 {c.title}</Text>
+                <Text style={styles.tileDescription}>{c.finished_at ? `🏁 Terminé le ${new Date(c.finished_at).toLocaleDateString('fr-FR')} · Podium définitif` : `${c.target_kme ? `${fmt(Number(c.target_kme))} kmE` : 'Défi durée'} · ${c.ends_at ? `Fin le ${new Date(c.ends_at).toLocaleDateString('fr-FR')}` : 'Sans date de fin'}`}</Text>
+                {!c.finished_at && !c.archived_at && <Text style={styles.muted}>Défi partagé • Code {c.invite_code}</Text>}
+              </TouchableOpacity>
+            ))}
+            {cloudChallenges.some(c => !!c.archived_at) && <Text style={styles.subtitle}>📦 Défis archivés</Text>}
+            {cloudChallenges.filter(c => !!c.archived_at).map(c => (
+              <TouchableOpacity key={c.id} style={styles.tile} onPress={() => openCloudChallenge(c.id)}>
+                <Text style={styles.tileTitle}>📦 {c.title}</Text>
+                <Text style={styles.tileDescription}>Archivé · Consulter le podium final</Text>
+              </TouchableOpacity>
+            ))}
+            {store.challenges.map(c => (
+              <TouchableOpacity key={c.id} style={styles.tile} onPress={() => { setCloudSelectedId(null); setSelectedId(c.id); setScreen('challenge'); }}>
+                <Text style={styles.tileTitle}>{c.name}</Text>
+                <Text style={styles.tileDescription}>{fmt(challengeScore(c))} / {fmt(c.goal)} kmE · {c.days} jours</Text>
+              </TouchableOpacity>
+            ))}
+          </View>
+        )}
+
+        {screen === 'create' && (
+          <View style={styles.section}>
+            <Text style={styles.title}>Nouveau défi 🔥</Text>
+            <Text style={styles.description}>Crée un défi partagé et invite tes amis avec un code.</Text>
+            <Text style={styles.label}>NOM DU DÉFI</Text>
+            <TextInput style={styles.input} placeholder="Ex : Les guerriers du dimanche" placeholderTextColor="#777" value={challengeName} onChangeText={setChallengeName} />
+            <Text style={styles.label}>OBJECTIF (KME)</Text>
+            <View style={styles.choices}>
+              {[50, 100, 200, 500].map(n => <TouchableOpacity key={n} style={[styles.choice, goal === String(n) && styles.selected]} onPress={() => setGoal(String(n))}><Text style={styles.white}>{n}</Text></TouchableOpacity>)}
+            </View>
+            <TextInput style={styles.input} value={goal} onChangeText={setGoal} keyboardType="decimal-pad" placeholder="Objectif en kmE" placeholderTextColor="#777" />
+            <Text style={styles.label}>DURÉE (JOURS)</Text>
+            <View style={styles.choices}>
+              {[7, 15, 30].map(n => <TouchableOpacity key={n} style={[styles.choice, days === String(n) && styles.selected]} onPress={() => setDays(String(n))}><Text style={styles.white}>{n} j</Text></TouchableOpacity>)}
+            </View>
+            <TextInput style={styles.input} value={days} onChangeText={setDays} keyboardType="number-pad" placeholder="Durée en jours" placeholderTextColor="#777" />
+            <Action title={cloudBusy ? 'Création en cours...' : 'Créer mon défi partagé →'} onPress={() => void createCloudChallenge()} />
+            <Action title="← Mes défis" secondary onPress={() => setScreen('challenges')} />
+          </View>
+        )}
+
+        {screen === 'challenge' && cloudSelected && (
+          <View style={styles.section}>
+            <Action title="← Mes défis" secondary onPress={backToChallenges} />
+            <Text style={styles.eyebrow}>{cloudSelected.archived_at ? 'DÉFI ARCHIVÉ 📦' : cloudSelected.finished_at ? 'DÉFI TERMINÉ 🏁' : 'DÉFI PARTAGÉ 🌐'}</Text>
+            <Text style={styles.title}>{cloudSelected.title}</Text>
+            <Text style={styles.description}>Objectif : {cloudSelected.target_kme ? `${fmt(Number(cloudSelected.target_kme))} kmE` : 'Durée'} · Fin : {cloudSelected.ends_at ? new Date(cloudSelected.ends_at).toLocaleDateString('fr-FR') : 'Non définie'}</Text>
+            {!cloudSelected.finished_at && !cloudSelected.archived_at && (
+              <View style={styles.card}>
+                <Text style={styles.label}>CODE D'INVITATION</Text>
+                <Text style={[styles.score, { fontSize: 30 }]} selectable>{cloudSelected.invite_code}</Text>
+                <Text style={styles.muted}>Communique ce code à tes amis pour qu'ils rejoignent le défi.</Text>
+                <Action title="📤 Inviter des amis" onPress={() => void shareCloudInvitation(cloudSelected)} />
+              </View>
+            )}
+             {rankingLoading && <ActivityIndicator color={ORANGE} />}
+             {!!rankingError && <Text style={styles.authNotice}>Classement indisponible : {rankingError}</Text>}
+             <View style={styles.card}>
+               <Text style={styles.label}>{cloudSelected.finished_at ? 'DÉFI TERMINÉ' : 'TEMPS RESTANT'}</Text>
+               <Text style={styles.countdown}>{cloudSelected.finished_at ? `🏁 ${new Date(cloudSelected.finished_at).toLocaleDateString('fr-FR')}` : cloudSelected.ends_at ? (() => {
+                 const ms = new Date(cloudSelected.ends_at).getTime() - clockNow;
+                 if (ms <= 0) return 'Défi terminé';
+                 const totalHours = Math.ceil(ms / 3600000);
+                 return `${Math.floor(totalHours / 24)} j ${totalHours % 24} h`;
+               })() : 'Sans limite'}</Text>
+               {!cloudSelected.finished_at && (
+  <Text style={styles.muted}>Classement synchronisé automatiquement</Text>
+)}
+             </View>
+             {cloudSelected.finished_at && rankingFinal && leaderboard.length > 0 && (
+                <View style={styles.card}>
+                  <Text style={styles.label}>🏆 VAINQUEUR DU DÉFI</Text>
+                  <Text style={styles.score}>{leaderboard.find(p => p.user_id === cloudSelected.winner_user_id)?.pseudo || leaderboard[0]?.pseudo || 'Vainqueur'}</Text>
+                  <Text style={styles.muted}>Classement définitif · {fmt(leaderboard[0]?.score || 0)} kmE</Text>
+                </View>
+              )}
+              <Text style={styles.subtitle}>🏆 {cloudSelected.finished_at ? 'Podium final FRUN' : 'Podium FRUN'}</Text>
+             <View style={styles.podiumWrap}>
+               {[1, 0, 2].map((rank) => {
+                 const player = leaderboard[rank];
+                 const heights = [145, 112, 90];
+                 const medals = ['🥇', '🥈', '🥉'];
+                 const shades = ['#F5B840', '#B7BEC8', '#C58A57'];
+                 return (
+                   <View key={rank} style={styles.podiumColumn}>
+                     <Text style={styles.crown}>{rank === 0 && player ? '👑' : ' '}</Text>
+                     <Text style={styles.medal}>{player ? medals[rank] : '·'}</Text>
+                     <Text style={styles.podiumName} numberOfLines={1}>{player?.pseudo || 'À venir'}</Text>
+                     <Text style={styles.podiumScore}>{player ? `${fmt(player.score)} kmE` : '—'}</Text>
+                     <View style={[styles.podiumStep, { height: heights[rank], borderTopColor: shades[rank] }]}>
+                       <Text style={[styles.podiumRank, { color: shades[rank] }]}>{rank + 1}</Text>
+                     </View>
+                   </View>
+                 );
+               })}
+             </View>
+             <View style={styles.card}>
+               <Text style={styles.label}>MA PROGRESSION DANS LE DÉFI</Text>
+               <Text style={styles.score}>{fmt((leaderboard.find(p => p.user_id === session.user.id)?.score ?? 0))} <Text style={styles.scoreUnit}>kmE</Text></Text>
+               {cloudSelected.target_kme && Number(cloudSelected.target_kme) > 0 ? <>
+                 <View style={styles.track}><View style={[styles.fill, { width: `${Math.min(100, (leaderboard.find(p => p.user_id === session.user.id)?.score ?? 0) / Number(cloudSelected.target_kme) * 100)}%` }]} /></View>
+                 <Text style={styles.muted}>{fmt(Math.min(100, (leaderboard.find(p => p.user_id === session.user.id)?.score ?? 0) / Number(cloudSelected.target_kme) * 100))} % de mon objectif ({fmt(Number(cloudSelected.target_kme))} kmE)</Text>
+               </> : <Text style={styles.muted}>Défi basé sur la durée</Text>}
+             </View>
+             <Text style={styles.subtitle}>👥 Classement ({leaderboard.length} joueurs)</Text>
+             {leaderboard.map((p, i) => (
+               <View key={p.user_id} style={styles.rankingRow}>
+                 <Text style={styles.rankingPosition}>{['🥇', '🥈', '🥉'][i] || `${i + 1}.`}</Text>
+                 <View style={{ flex: 1 }}>
+                   <Text style={styles.white} numberOfLines={1}>{p.pseudo}{p.user_id === session.user.id ? ' (moi)' : ''}</Text>
+                   {p.activities !== null && <Text style={styles.muted}>{p.activities} performance(s)</Text>}
+                 </View>
+                 <Text style={styles.rankingScore}>{fmt(p.score)} kmE</Text>
+               </View>
+             ))}
+             {!rankingLoading && !rankingError && leaderboard.length === 0 && <Text style={styles.description}>Aucun participant à afficher pour le moment.</Text>}
+             <Text style={styles.muted}>{cloudSelected.finished_at ? 'Classement figé à la clôture. Les nouvelles performances restent dans ton historique et comptent pour tes autres défis actifs.' : 'Seules les performances synchronisées effectuées pendant ce défi comptent. Les modifications et suppressions actualisent les défis encore actifs.'}</Text>
+              {!cloudSelected.archived_at && <Action title={cloudSelected.finished_at ? '+ Enregistrer une performance personnelle' : '+ Enregistrer une performance'} onPress={() => openActivity('challenge')} />}
+              <Text style={styles.subtitle}>Gestion du défi</Text>
+              {cloudSelected.creator_id === session.user.id ? (
+                <View style={styles.challengeManagementRow}>
+                  {!cloudSelected.archived_at && (
+                    <TouchableOpacity disabled={cloudBusy} activeOpacity={0.8} style={[styles.challengeManagementButton, cloudBusy && styles.disabledButton]} onPress={() => confirmArchiveCloudChallenge(cloudSelected)}>
+                      <Text style={styles.challengeManagementText}>📦 Archiver ce défi</Text>
+                    </TouchableOpacity>
+                  )}
+                  <TouchableOpacity disabled={cloudBusy} activeOpacity={0.8} style={[styles.challengeManagementButton, styles.challengeDeleteButton, cloudBusy && styles.disabledButton]} onPress={() => confirmDeleteCloudChallenge(cloudSelected)}>
+                    <Text style={styles.challengeManagementText}>🗑️ Supprimer pour tous</Text>
+                  </TouchableOpacity>
+                </View>
+              ) : <Action title={cloudBusy ? 'Patiente...' : '🚪 Quitter ce défi'} secondary onPress={() => confirmLeaveCloudChallenge(cloudSelected)} />}
+
+          </View>
+        )}
+
+        {screen === 'challenge' && !cloudSelectedId && selected && (
+          <View style={styles.section}>
+            <Action title="← Mes défis" secondary onPress={() => setScreen('challenges')} />
+            <Text style={styles.eyebrow}>MON DÉFI</Text>
+            <Text style={styles.title}>{selected.name}</Text>
+            <Text style={styles.description}>Objectif : {fmt(selected.goal)} kmE · {selected.days} jours</Text>
+            <View style={styles.card}>
+              <Text style={styles.label}>MON SCORE</Text>
+              <Text style={styles.score}>{fmt(challengeScore(selected))} <Text style={styles.scoreUnit}>kmE</Text></Text>
+              <View style={styles.track}><View style={[styles.fill, { width: `${Math.min(100, challengeScore(selected) / selected.goal * 100)}%` }]} /></View>
+              <Text style={styles.muted}>{fmt(Math.min(100, challengeScore(selected) / selected.goal * 100))} % de l'objectif</Text>
+            </View>
+            <Action title="+ Ajouter une activité" onPress={() => openActivity('challenge')} />
+            <Text style={styles.subtitle}>🏅 Classement</Text>
+            <View style={styles.tile}>
+              <Text style={styles.white}>🥇 {store.nickname} — {fmt(challengeScore(selected))} kmE</Text>
+              <Text style={styles.muted}>Les autres participants apparaîtront quand les invitations seront activées.</Text>
+            </View>
+            <Action title="Inviter des adversaires (bientôt)" secondary onPress={shareInvitation} />
+            <Text style={styles.subtitle}>Activités du défi</Text>
+            {challengeActivities(selected).length ? challengeActivities(selected).sort((a, b) => b.createdAt - a.createdAt).map(activityRow) : <Text style={styles.description}>Aucune activité enregistrée depuis le début de ce défi.</Text>}
+            <Action title="🗑️ Supprimer ce défi" secondary onPress={() => confirmDeleteChallenge(selected)} />
+          </View>
+        )}
+
+        {screen === 'progress' && (() => {
+          const now = new Date();
+          const start = new Date(now.getFullYear(), now.getMonth() - (progressPeriod || 12) + 1, 1);
+          const earliest = Math.min(...store.activities.map(a => a.createdAt), ...weights.map(w => new Date(w.measured_on + 'T12:00:00').getTime()), now.getTime());
+          if (progressPeriod === 0) { const d = new Date(earliest); start.setFullYear(d.getFullYear(), d.getMonth(), 1); }
+          const months: { key: string; label: string; kme: number; count: number; weight?: number }[] = [];
+          const cursor = new Date(start.getFullYear(), start.getMonth(), 1);
+          while (cursor <= now && months.length < 120) {
+            const y = cursor.getFullYear(), m = cursor.getMonth();
+            const monthActivities = store.activities.filter(a => { const d = new Date(a.createdAt); return d.getFullYear() === y && d.getMonth() === m; });
+            const monthlyWeights = weights.filter(w => { const d = new Date(w.measured_on + 'T12:00:00'); return d.getFullYear() === y && d.getMonth() === m; });
+            months.push({ key: `${y}-${m}`, label: cursor.toLocaleDateString('fr-FR', { month: 'short' }),
+              kme: monthActivities.reduce((n, a) => n + a.points, 0), count: monthActivities.length,
+              weight: monthlyWeights.length ? monthlyWeights[monthlyWeights.length - 1].weight_kg : undefined });
+            cursor.setMonth(cursor.getMonth() + 1);
+          }
+                     const maxActivity = Math.max(1, ...months.map(m => m[progressMetric]));
+           const activityStep = Math.max(1, Math.ceil(maxActivity / 4));
+           const activityCeiling = activityStep * 4;
+           const measured = months.map((m, i) => ({ i, weight: m.weight })).filter((m): m is { i: number; weight: number } => m.weight !== undefined);
+           const minMeasuredWeight = measured.length ? Math.min(...measured.map(w => w.weight)) : 0;
+           const maxMeasuredWeight = measured.length ? Math.max(...measured.map(w => w.weight)) : 0;
+           const minWeight = measured.length ? Math.floor(minMeasuredWeight - 1) : 0;
+           const maxWeight = measured.length ? Math.max(minWeight + 2, Math.ceil(maxMeasuredWeight + 1)) : 1;
+           const chartHeight = 150;
+           const plotTop = 12;
+           const plotHeight = 120;
+           const chartWidth = Math.max(270, months.length * 45);
+           const slot = chartWidth / Math.max(1, months.length);
+           const weightPoint = (item: { i: number; weight: number }) => ({
+             x: (item.i + 0.5) * slot,
+             y: plotTop + (1 - (item.weight - minWeight) / (maxWeight - minWeight)) * plotHeight,
+           });
+const practicedSports = sports.filter(sp => store.activities.some(a => a.sport === sp.name));
+          const selectedRecordSport = practicedSports.some(sp => sp.name === recordSport) ? recordSport : practicedSports[0]?.name;
+          const records = store.activities.filter(a => a.sport === selectedRecordSport);
+          const best = (field: 'amount' | 'elevation' | 'points') => records.length ? records.reduce((a, b) => b[field] > a[field] ? b : a) : null;
+          const latestWeight = weights.length ? weights[weights.length - 1] : null;
+          const displayed = progressHistoryAll ? activitiesSorted : activitiesSorted.slice(0, 5);
+          return (
+            <View style={styles.section}>
+              <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: 8 }}>
+                <Text style={[styles.eyebrow, { flexShrink: 1 }]}>FRUN / MON ESPACE</Text>
+                <TouchableOpacity accessibilityRole="button" accessibilityLabel="Retour à l’accueil" onPress={() => setScreen('welcome')} style={{ backgroundColor: PANEL, borderWidth: 1, borderColor: '#37373B', borderRadius: 20, paddingHorizontal: 13, paddingVertical: 8 }}>
+                  <Text style={{ color: '#FFFFFF', fontSize: 13, fontWeight: '800' }}>⌂ Accueil</Text>
+                </TouchableOpacity>
+              </View>
+              <Text style={styles.title}>📈 Ma progression</Text>
+              <View style={{ backgroundColor: '#33251C', borderRadius: 11, borderWidth: 1, borderColor: '#704321', paddingHorizontal: 12, paddingVertical: 9, gap: 3 }}>
+                <Text style={{ color: '#FFAB69', fontWeight: '800', fontSize: 12 }}>✨ TON MOMENT FRUN</Text>
+                <Text style={[styles.tileTitle, { fontSize: 16 }]} numberOfLines={1} adjustsFontSizeToFit>{store.activities.length ? 'Tu progresses, continue ! 💪' : 'Ton aventure commence ici ! 🔥'}</Text>
+                <Text style={[styles.tileDescription, { fontSize: 12, lineHeight: 17 }]} numberOfLines={1} adjustsFontSizeToFit>{store.activities.length ? `${store.activities.filter(a => a.createdAt >= Date.now() - 7 * DAY_MS).length} séance(s) ces 7 derniers jours` : 'Enregistre ta première activité !'}</Text>
+              </View>
+              <View style={{ flexDirection: 'row', gap: 8 }}>
+                {[{ value: fmt(totalSolo), unit: 'kmE', label: 'Au total' }, { value: String(store.activities.length), unit: 'séances', label: 'Réalisées' }, { value: String(sports.reduce((n, sp) => n + (store.activities.some(a => a.sport === sp.name) ? 1 : 0), 0)), unit: 'sports', label: 'Pratiqués' }].map(x => (
+                  <View key={x.unit} style={{ flex: 1, backgroundColor: PANEL, borderRadius: 13, padding: 10, alignItems: 'center' }}>
+                    <Text style={{ color: ORANGE, fontWeight: '900', fontSize: 23 }} numberOfLines={1} adjustsFontSizeToFit>{x.value}</Text>
+                    <Text style={{ color: '#FFF', fontSize: 12, fontWeight: '700' }}>{x.unit}</Text>
+                    <Text style={styles.muted}>{x.label}</Text>
+                  </View>
+                ))}
+              </View>
+              <View style={styles.card}>
+                <Text style={styles.subtitle}>🏆 Mes records personnels</Text>
+                <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ gap: 8 }}>
+                  {practicedSports.map(sp => <TouchableOpacity key={sp.name} onPress={() => setRecordSport(sp.name)} style={[styles.choice, selectedRecordSport === sp.name && styles.selected]}><Text style={styles.white}>{sp.emoji || '🎾'} {sp.name}</Text></TouchableOpacity>)}
+                </ScrollView>
+                {records.length ? <>
+                  <Text style={styles.white}>🥇 {sports.find(x => x.name === selectedRecordSport)?.unit === 'min' ? 'Durée' : 'Distance'} : {fmt(best('amount')!.amount)} {sports.find(x => x.name === selectedRecordSport)?.unit}  · {best('amount')!.date}</Text>
+                  {(selectedRecordSport === 'Course' || selectedRecordSport === 'Vélo') && <Text style={styles.white}>⛰️ Dénivelé : {fmt(best('elevation')!.elevation)} m  · {best('elevation')!.date}</Text>}
+                  <Text style={styles.white}>🏆 Score FRUN : {fmt(best('points')!.points)} kmE  · {best('points')!.date}</Text>
+                </> : <Text style={styles.muted}>Aucune activité enregistrée pour le moment. Tes records apparaîtront ici après ta première séance !</Text>}
+              </View>
+              <View style={styles.card}>
+                <Text style={styles.subtitle}>{weights.length ? '📊 Sport & évolution du poids' : '📊 Évolution des activités'}</Text>
+                <View style={{ flexDirection: 'row', gap: 4 }}>
+                  {([1, 3, 6, 12, 0] as const).map(n => <TouchableOpacity key={n} onPress={() => setProgressPeriod(n)} style={[styles.choice, { flex: 1, minWidth: 0, paddingHorizontal: 2, paddingVertical: 8, alignItems: 'center' }, progressPeriod === n && styles.selected]}><Text style={[styles.white, { fontSize: 11 }]} numberOfLines={1} adjustsFontSizeToFit>{n === 0 ? 'Tout' : `${n} mois`}</Text></TouchableOpacity>)}
+                </View>
+                <Text style={styles.muted}>{weights.length ? '🟠 Nombre de séances   ⚪ Poids (kg)' : '🟠 Nombre de séances'}</Text>
+                                 <View style={{ flexDirection: 'row', alignItems: 'flex-start', gap: 3 }}>
+                   <View style={{ width: 30, height: chartHeight, position: 'relative' }}>
+                     {[0, 1, 2, 3, 4].map(i => <Text key={i} style={{ position: 'absolute', top: plotTop + i * plotHeight / 4 - 7, right: 1, color: '#FFAB69', fontSize: 10, textAlign: 'right' }}>{activityStep * (4 - i)}</Text>)}
+                   </View>
+                   <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{ flex: 1 }}>
+                     <View style={{ width: chartWidth }}>
+                       <View style={{ height: chartHeight, position: 'relative', backgroundColor: '#18181B', borderRadius: 8, overflow: 'hidden' }}>
+                         {[0, 1, 2, 3, 4].map(i => <View key={i} style={{ position: 'absolute', left: 0, right: 0, top: plotTop + i * plotHeight / 4, borderTopWidth: 1, borderTopColor: '#38383D' }} />)}
+                         {months.map((m, i) => <View key={m.key} style={{ position: 'absolute', left: i * slot + slot * .25, top: plotTop + plotHeight * (1 - m.count / activityCeiling), width: slot * .5, height: plotHeight * m.count / activityCeiling, borderTopLeftRadius: 4, borderTopRightRadius: 4, backgroundColor: ORANGE, opacity: .85 }} />)}
+                         {measured.slice(1).map((item, i) => {
+                           const a = weightPoint(measured[i]);
+                           const b = weightPoint(item);
+                           const dx = b.x - a.x, dy = b.y - a.y;
+                           return <View key={`line-${i}`} style={{ position: 'absolute', left: (a.x + b.x) / 2 - Math.hypot(dx, dy) / 2, top: (a.y + b.y) / 2 - 1.5, width: Math.hypot(dx, dy), height: 3, borderRadius: 2, backgroundColor: '#FFFFFF', transform: [{ rotate: `${Math.atan2(dy, dx)}rad` }] }} />;
+                         })}
+                         {measured.map((item, i) => <View key={`dot-${i}`} style={{ position: 'absolute', left: weightPoint(item).x - 4, top: weightPoint(item).y - 4, width: 8, height: 8, borderRadius: 4, backgroundColor: '#FFFFFF' }} />)}
+                       </View>
+                       <View style={{ flexDirection: 'row', marginTop: 8 }}>{months.map(m => <Text key={m.key} style={{ width: slot, color: '#AAA', textAlign: 'center', fontSize: 10 }}>{m.label}</Text>)}</View>
+                     </View>
+                   </ScrollView>
+                   {measured.length > 0 && <View style={{ width: 36, height: chartHeight, position: 'relative' }}>
+                     {[0, 1, 2, 3, 4].map(i => <Text key={i} style={{ position: 'absolute', top: plotTop + i * plotHeight / 4 - 7, left: 1, color: '#FFFFFF', fontSize: 10 }}>{fmt(minWeight + (maxWeight - minWeight) * (4 - i) / 4)}</Text>)}
+                   </View>}
+                 </View>
+                 <View style={{ flexDirection: 'row', justifyContent: 'space-between' }}>
+                   <Text style={{ color: '#FFAB69', fontSize: 11, fontWeight: '700' }}>↑ Séances</Text>
+                   {measured.length > 0 && <Text style={{ color: '#FFF', fontSize: 11, fontWeight: '700' }}>Poids (kg) ↑</Text>}
+                 </View>
+{!!weights.length && <Text style={styles.muted}>Deux échelles indépendantes : ce graphique montre des tendances, pas une relation de cause à effet.</Text>}
+              </View>
+              <View style={styles.card}>
+                <Text style={styles.subtitle}>{weights.length ? '⚖️ Mon poids (privé)' : '⚖️ Ajouter mon poids (facultatif)'}</Text>
+                {latestWeight && <Text style={styles.description}>Dernière mesure : {fmt(latestWeight.weight_kg)} kg · {latestWeight.measured_on}</Text>}
+                <Text style={styles.label}>POIDS EN KG</Text>
+                <TextInput style={styles.input} value={weightInput} onChangeText={setWeightInput} placeholder="Ex : 82,5" placeholderTextColor="#777" keyboardType="decimal-pad" />
+                <Text style={styles.label}>DATE (AAAA-MM-JJ)</Text>
+                <TextInput style={styles.input} value={weightDate} onChangeText={setWeightDate} placeholder="2026-11-07" placeholderTextColor="#777" autoCapitalize="none" />
+                <Action title={weightBusy ? 'Enregistrement...' : '+ Enregistrer ma mesure'} onPress={() => void saveWeight()} />
+                {weights.length > 0 && <Text style={styles.label}>HISTORIQUE DU POIDS</Text>}
+                {weights.slice().reverse().slice(0, 8).map(w => <View key={w.id} style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}><Text style={styles.white}>{w.measured_on} · {fmt(w.weight_kg)} kg</Text><TouchableOpacity onPress={() => deleteWeight(w)}><Text style={{ color: '#FF7777', padding: 8 }}>Supprimer</Text></TouchableOpacity></View>)}
+                <Text style={styles.muted}>Ces données sont personnelles et ne sont jamais visibles dans les défis.</Text>
+              </View>
+              <View style={styles.card}>
+                <Text style={styles.subtitle}>📅 Mes dernières activités</Text>
+                {displayed.length ? displayed.map(a => <View key={a.id} style={{ paddingVertical: 5 }}><Text style={styles.white}>{sports.find(sp => sp.name === a.sport)?.emoji} {a.sport} · +{fmt(a.points)} kmE</Text><Text style={styles.muted}>{a.date} · {fmt(a.amount)} {sports.find(sp => sp.name === a.sport)?.unit}{a.elevation ? ` · D+ ${fmt(a.elevation)} m` : ''}</Text></View>) : <Text style={styles.muted}>Aucune activité pour le moment.</Text>}
+                {activitiesSorted.length > 5 && <Action title={progressHistoryAll ? 'Afficher moins' : 'Tout mon historique'} secondary onPress={() => setProgressHistoryAll(!progressHistoryAll)} />}
+              </View>
+              <Action title="⌂ Retour à l'accueil" secondary onPress={() => setScreen('welcome')} />
+            </View>
+          );
+        })()}
+
+        {screen === 'performances' && (
+          <View style={styles.section}>
+            <Text style={styles.title}>💪 Mes performances</Text>
+            <View style={styles.card}>
+              <Text style={styles.label}>TOTAL DE MES ACTIVITÉS</Text>
+              <Text style={styles.score}>{fmt(totalSolo)} <Text style={styles.scoreUnit}>kmE</Text></Text>
+              <Text style={styles.muted}>{store.activities.length} activité(s) enregistrée(s)</Text>
+            </View>
+            <View style={styles.challengeNavRow}>
+              <TouchableOpacity accessibilityRole="button" accessibilityLabel="Enregistrer une performance" activeOpacity={0.8} style={[styles.challengeNavButton, styles.challengeNavCreate]} onPress={() => openActivity('performances')}>
+                <Text style={styles.challengeNavCreateText}>+ Enregistrer une perf</Text>
+              </TouchableOpacity>
+              <TouchableOpacity accessibilityRole="button" accessibilityLabel="Retour à l'accueil" activeOpacity={0.8} style={[styles.challengeNavButton, styles.challengeNavHome]} onPress={() => setScreen('welcome')}>
+                <Text style={styles.challengeNavHomeText}>⌂ Accueil</Text>
+              </TouchableOpacity>
+            </View>
+            <Text style={styles.subtitle}>Mon historique</Text>
+            {activitiesSorted.length ? activitiesSorted.map(activityRow) : <Text style={styles.description}>Aucune activité pour le moment. À toi de jouer !</Text>}
+          </View>
+        )}
+
+        {screen === 'activity' && (
+          <View style={styles.section}>
+            <View style={styles.activityTitleRow}>
+              <Text style={[styles.title, { flexShrink: 1 }]}>{editingId ? 'Modifier la performance ✏️' : 'Nouvelle activité 💥'}</Text>
+              <TouchableOpacity
+                accessibilityRole="button"
+                accessibilityLabel="Comprendre le calcul des points"
+                onPress={() => Alert.alert(
+                  '💡 Comment gagner des kmE ?',
+                  'Chaque activité rapporte des kilomètres équivalents (kmE) :\n\n' +
+                  '🏃 Course : 1 km = 1 kmE\n' +
+                  '🚴 Vélo : 2,5 km = 1 kmE\n' +
+                  '🏋️ CrossFit : 8 min = 1 kmE\n' +
+                  '💪 HYROX : 6 min = 1 kmE\n' +
+                  '🏊 Natation : 250 m = 1 kmE\n' +
+                  '🎾 Tennis : 10 min = 1 kmE\n' +
+                  'Padel : 20 min = 1 kmE\n\n' +
+                  'Bonus dénivelé positif :\n' +
+                  '• Course : +1 kmE par 100 m de D+\n' +
+                  '• Vélo : +0,6 kmE par 100 m de D+\n\n' +
+                  'Ces équivalences sont propres à FRUN et ne constituent pas une mesure scientifique.',
+                  [{ text: 'Compris !' }]
+                )}
+                style={styles.pointsHelpButton}
+              >
+                <Text style={styles.pointsHelpIcon}>💡</Text>
+              </TouchableOpacity>
+            </View>
+             <Text style={styles.description}>Une seule saisie, même si tu participes à plusieurs défis.</Text>
+             <Text style={styles.muted}>Les performances synchronisees peuvent etre modifiees ou supprimees sur tous tes appareils. Les anciennes performances locales sont conservees a part.</Text>
+            <Text style={styles.label}>TON SPORT</Text>
+            <View style={styles.sportsGrid}>
+              {sports.map(item => (
+                <TouchableOpacity key={item.name} style={[styles.sportButton, sport === item.name && styles.selectedSport]} onPress={() => { setSport(item.name); setAmount(''); setElevation(''); }}>
+                  <SportIcon sport={item.name} size={32} />
+                  <Text style={styles.sportName}>{item.name}</Text>
+                </TouchableOpacity>
+              ))}
+            </View>
+            <Text style={styles.label}>{sports.find(s => s.name === sport)?.unit === 'min' ? 'DURÉE (MINUTES)' : sport === 'Natation' ? 'DISTANCE (MÈTRES)' : 'DISTANCE (KM)'}</Text>
+            <TextInput style={styles.input} value={amount} onChangeText={setAmount} keyboardType="decimal-pad" placeholder={sport === 'Natation' ? 'Ex : 1000' : hasElevation ? 'Ex : 10' : 'Ex : 60'} placeholderTextColor="#777" />
+            {hasElevation && <>
+              <Text style={styles.label}>DÉNIVELÉ POSITIF (M)</Text>
+              <TextInput style={styles.input} value={elevation} onChangeText={setElevation} keyboardType="decimal-pad" placeholder="Facultatif, ex : 150" placeholderTextColor="#777" />
+            </>}
+            <View style={styles.card}>
+              <Text style={styles.label}>{editingId ? 'NOUVEAU SCORE' : 'TU VAS GAGNER'}</Text>
+              <Text style={styles.score}>+{fmt(preview)} <Text style={styles.scoreUnit}>kmE</Text></Text>
+            </View>
+             <Action title={activityBusy ? 'Synchronisation en cours...' : editingId ? 'Enregistrer la correction ✓' : "Enregistrer l'activité ✓"} onPress={() => { if (!activityBusy) void saveActivity(); }} />
+            <Action title="← Retour" secondary onPress={() => { setEditingId(null); setScreen(activityReturn); }} />
+          </View>
+        )}
+
+        {screen === 'join' && (
+          <View style={styles.section}>
+            <Text style={styles.title}>🤝 Rejoindre un défi</Text>
+            <Text style={styles.description}>Saisis le code d'invitation reçu de ton ami.</Text>
+            <Text style={styles.label}>CODE D'INVITATION</Text>
+            <TextInput style={styles.input} value={joinCode} onChangeText={setJoinCode} autoCapitalize="characters" placeholder="Ex : A7F3B9C2D1" placeholderTextColor="#777" editable={!cloudBusy} />
+            <View style={styles.challengeNavRow}>
+              <TouchableOpacity accessibilityRole="button" accessibilityLabel="Rejoindre ce défi" disabled={cloudBusy} activeOpacity={0.8} style={[styles.challengeNavButton, styles.challengeNavCreate, cloudBusy && { opacity: 0.6 }]} onPress={() => { if (!cloudBusy) void joinCloudChallenge(); }}>
+                <Text style={styles.challengeNavCreateText}>{cloudBusy ? 'Connexion...' : '🤝 Rejoindre ce défi'}</Text>
+              </TouchableOpacity>
+              <TouchableOpacity accessibilityRole="button" accessibilityLabel="Retour à l'accueil" activeOpacity={0.8} style={[styles.challengeNavButton, styles.challengeNavHome]} onPress={() => setScreen('welcome')}>
+                <Text style={styles.challengeNavHomeText}>⌂ Accueil</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        )}
+      </ScrollView>
+    </SafeAreaView>
+  );
+}
+
+const styles = StyleSheet.create({
+  activityTitleRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: 10 },
+  pointsHelpButton: { width: 46, height: 46, borderRadius: 23, backgroundColor: '#33251C', borderWidth: 1, borderColor: ORANGE, alignItems: 'center', justifyContent: 'center' },
+  pointsHelpIcon: { fontSize: 24 },
+  challengeManagementRow: { flexDirection: 'row', gap: 9, alignItems: 'stretch' },
+  challengeManagementButton: { flex: 1, minHeight: 58, backgroundColor: PANEL, borderRadius: 12, paddingHorizontal: 9, paddingVertical: 12, alignItems: 'center', justifyContent: 'center' },
+  challengeDeleteButton: { backgroundColor: '#382224' },
+  challengeManagementText: { color: '#FFFFFF', fontSize: 13, fontWeight: '800', textAlign: 'center' },
+  disabledButton: { opacity: 0.5 },
+  challengeNavRow: { flexDirection: 'row', gap: 10, alignItems: 'stretch' },
+  challengeNavButton: { flex: 1, minWidth: 0, minHeight: 52, borderRadius: 13, alignItems: 'center', justifyContent: 'center', paddingHorizontal: 7 },
+  challengeNavCreate: { backgroundColor: ORANGE },
+  challengeNavCreateText: { color: '#FFF', fontSize: 14, fontWeight: '800', textAlign: 'center' },
+  challengeNavHome: { backgroundColor: PANEL, borderColor: '#37373B', borderWidth: 1 },
+  challengeNavHomeText: { color: '#FFF', fontSize: 14, fontWeight: '800', textAlign: 'center' },
+  countdown: { color: '#FFF', fontSize: 28, fontWeight: '900' },
+  podiumWrap: { flexDirection: 'row', alignItems: 'flex-end', gap: 7, paddingTop: 8 },
+  podiumColumn: { flex: 1, alignItems: 'center' },
+  crown: { fontSize: 24, height: 31, textAlign: 'center' },
+  medal: { fontSize: 35, textAlign: 'center' },
+  podiumName: { color: '#FFF', fontWeight: '800', fontSize: 12, marginTop: 4, textAlign: 'center' },
+  podiumScore: { color: ORANGE, fontWeight: '800', fontSize: 12, marginTop: 4, marginBottom: 9 },
+  podiumStep: { width: '100%', backgroundColor: '#29292D', borderTopWidth: 5, borderTopLeftRadius: 10, borderTopRightRadius: 10, alignItems: 'center', justifyContent: 'center' },
+  podiumRank: { fontSize: 38, fontWeight: '900' },
+  rankingRow: { flexDirection: 'row', alignItems: 'center', backgroundColor: PANEL, padding: 15, borderRadius: 12, gap: 12 },
+  rankingPosition: { width: 36, fontSize: 23, textAlign: 'center', color: '#FFF', fontWeight: '800' },
+  rankingScore: { color: ORANGE, fontSize: 16, fontWeight: '900' },
+  authContainer: { paddingHorizontal: 24, paddingTop: 56, paddingBottom: 60, gap: 12 },
+  authLink: { color: ORANGE, fontSize: 14, fontWeight: '700' },
+  authNotice: { color: '#FFD19B', backgroundColor: '#35261C', padding: 12, borderRadius: 10, fontSize: 13 },
+  homeLinkWrap: { alignItems: 'center', marginTop: 1, marginBottom: -6 },
+  homeLink: { minHeight: 44, paddingHorizontal: 15, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8, borderWidth: 1, borderColor: '#37373B', backgroundColor: '#19191C', borderRadius: 24 },
+  homeLinkIcon: { color: ORANGE, fontSize: 22, fontWeight: '700', marginTop: -3 },
+  homeLinkText: { color: '#DADADD', fontSize: 13, fontWeight: '700' },
+  homeLinkArrow: { color: '#929299', fontSize: 22, marginTop: -3 },
+  activityActions: { flexDirection: 'row', justifyContent: 'flex-end', gap: 4, marginTop: 0 },
+  smallAction: { width: 33, height: 32, alignItems: 'center', justifyContent: 'center', borderRadius: 8 },
+  smallActionText: { color: '#FFFFFF', fontSize: 15 },
+  deleteText: { color: '#FF7777', fontSize: 15 },
+  safe: { flex: 1, backgroundColor: BG },
+  loading: { flex: 1, backgroundColor: BG, justifyContent: 'center', alignItems: 'center', gap: 16 },
+  container: { paddingHorizontal: 22, paddingTop: 28, paddingBottom: 70 },
+  header: { alignItems: 'center', marginBottom: 32 },
+  logo: { color: '#FFF', fontSize: 40, fontWeight: '900', letterSpacing: 3 },
+  tagline: { color: '#888', fontSize: 10, letterSpacing: 2, marginTop: 5 },
+  section: { gap: 14 },
+  title: { color: '#FFF', fontSize: 29, fontWeight: '800' },
+  subtitle: { color: '#FFF', fontSize: 20, fontWeight: '800', marginTop: 16 },
+  description: { color: '#AAA', fontSize: 15, lineHeight: 23 },
+  muted: { color: '#999', fontSize: 12, lineHeight: 18 },
+  white: { color: '#FFF', fontWeight: '700' },
+  eyebrow: { color: ORANGE, fontSize: 12, fontWeight: '800', letterSpacing: 2 },
+  label: { color: '#AAA', fontSize: 12, fontWeight: '700', letterSpacing: 1, marginTop: 8 },
+  input: { backgroundColor: PANEL, color: '#FFF', borderRadius: 13, paddingHorizontal: 16, paddingVertical: 15, fontSize: 17, borderWidth: 1, borderColor: '#333' },
+  button: { backgroundColor: ORANGE, borderRadius: 14, padding: 18, alignItems: 'center', marginTop: 8 },
+  buttonText: { color: '#FFF', fontSize: 16, fontWeight: '800' },
+  secondaryButton: { backgroundColor: PANEL, marginTop: 0 },
+  secondaryButtonText: { color: '#CCC' },
+  mainTile: { backgroundColor: ORANGE, padding: 20, borderRadius: 16, gap: 8, marginTop: 12 },
+  tile: { backgroundColor: PANEL, padding: 20, borderRadius: 16, gap: 8 },
+  tileTitle: { color: '#FFF', fontSize: 20, fontWeight: '800' },
+  tileDescription: { color: '#DDD', fontSize: 13, lineHeight: 20 },
+  choices: { flexDirection: 'row', flexWrap: 'wrap', gap: 8 },
+  choice: { backgroundColor: PANEL, borderColor: '#333', borderWidth: 1, paddingHorizontal: 17, paddingVertical: 12, borderRadius: 10 },
+  selected: { borderColor: ORANGE },
+  card: { backgroundColor: PANEL, borderRadius: 18, padding: 22, gap: 12, marginVertical: 8 },
+  score: { color: ORANGE, fontSize: 38, fontWeight: '900' },
+  scoreUnit: { color: '#FFF', fontSize: 19 },
+  track: { height: 10, borderRadius: 10, backgroundColor: '#3A3A3D', overflow: 'hidden' },
+  fill: { height: '100%', backgroundColor: ORANGE, borderRadius: 10 },
+  sportsGrid: { flexDirection: 'row', flexWrap: 'wrap', gap: 9 },
+  sportButton: { width: '30%', backgroundColor: PANEL, borderColor: '#333', borderWidth: 1, borderRadius: 13, alignItems: 'center', paddingVertical: 15, gap: 6 },
+  selectedSport: { borderColor: ORANGE, backgroundColor: '#33251C' },
+  sportName: { color: '#FFF', fontSize: 12, fontWeight: '700' },
+  activityRow: { backgroundColor: PANEL, borderRadius: 10, paddingHorizontal: 10, paddingVertical: 6, gap: 1 },
+  activityTop: { flexDirection: 'row', alignItems: 'center', gap: 5, minHeight: 32 },
+  activityName: { color: '#FFF', fontSize: 13, fontWeight: '700', flex: 1 },
+  orangeText: { color: ORANGE, fontSize: 12, fontWeight: '800' },
+  activityDetails: { color: '#999', fontSize: 11, lineHeight: 15 },
+});
